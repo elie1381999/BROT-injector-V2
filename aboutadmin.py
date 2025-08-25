@@ -28,7 +28,7 @@ async def _send_admin_message(context: ContextTypes.DEFAULT_TYPE, text: str, par
         await context.bot.send_message(chat_id=admin_chat_id, text=text, parse_mode=parse_mode)
         return True
     except Exception as e:
-        logger.exception("Failed sending admin message with parse_mode=%s: %s", parse_mode, e)
+        logger.error("Failed sending admin message with parse_mode=%s: %s\nProblematic text: %s", parse_mode, e, text)
         # Retry without Markdown
         try:
             await context.bot.send_message(chat_id=admin_chat_id, text=text, parse_mode=None)
@@ -38,11 +38,11 @@ async def _send_admin_message(context: ContextTypes.DEFAULT_TYPE, text: str, par
             logger.exception("Failed sending admin message without parse_mode.")
             return False
 
-# Minimal markdown-escape for backticks, asterisks, and other sensitive characters
+# Enhanced Markdown-escape for Telegram Markdown V2
 def _md_escape_short(s: str) -> str:
     if not isinstance(s, str):
         s = str(s)
-    # Escape all Markdown-sensitive characters
+    # Escape all Telegram Markdown V2 special characters
     for char in ('*', '_', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'):
         s = s.replace(char, f'\\{char}')
     return s
@@ -107,7 +107,7 @@ async def _immediate_admin_alert(context: ContextTypes.DEFAULT_TYPE, actor: Dict
     except Exception:
         logger.exception("Failed to send immediate admin alert")
 
-# ---------------- buffered admin-notification system (global) ----------------
+# Buffered admin-notification system (global)
 async def buffer_admin_action(context: ContextTypes.DEFAULT_TYPE, actor: Optional[dict], action: str, target: Optional[str] = None, extra: Optional[str] = None):
     """
     Stores events in application-level buffer and schedules a delayed summary ~60s after the last activity.
@@ -154,13 +154,12 @@ async def buffer_admin_action(context: ContextTypes.DEFAULT_TYPE, actor: Optiona
                 a = e.get("actor") or {}
                 uname = a.get("username") or "unknown"
                 name = a.get("name") or ""
-                uid = a.get("id") or ""
                 phone = a.get("phone") or ""
                 lang = a.get("language") or "unknown"
-                act = e.get("action")
+                act = e.get("action") or ""
                 tgt = e.get("target") or ""
                 extra_e = e.get("extra") or ""
-                lines.append(f"• {name} (@{uname}) id={uid} phone={phone} lang={lang} — {act} — target: {tgt} {('· ' + extra_e) if extra_e else ''}")
+                lines.append(f"• {name} (@{uname}) id={a.get('id', '')} phone={phone} lang={lang} — {act} — target: {tgt} {('· ' + extra_e) if extra_e else ''}")
             text = "\n".join(lines)
             ok = await _send_admin_message(context, text)
             if not ok:
