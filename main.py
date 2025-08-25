@@ -11,6 +11,7 @@ import time
 import socket
 import random
 import json
+from urllib.parse import urlparse
 
 import aboutteleg
 import aboutadmin
@@ -80,6 +81,19 @@ class InstagramWrapper:
             "user_agent": "Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Mobile Safari/537.36"
         }
 
+    def is_valid_proxy(self, proxy_url):
+        """Validate proxy URL format"""
+        if not proxy_url:
+            return False
+            
+        try:
+            parsed = urlparse(proxy_url)
+            if not all([parsed.scheme, parsed.netloc]):
+                return False
+            return True
+        except:
+            return False
+
     async def resolve_challenge(self, challenge_exception):
         """Handle Instagram challenge requirements"""
         try:
@@ -116,10 +130,12 @@ class InstagramWrapper:
                 # Set device settings
                 await asyncio.to_thread(self.client.set_device, self.device_settings)
                 
-                # Set proxy if configured
-                if self.proxy:
+                # Set proxy if configured and valid
+                if self.proxy and self.is_valid_proxy(self.proxy):
                     logger.info(f"Using proxy: {self.proxy}")
                     await asyncio.to_thread(self.client.set_proxy, self.proxy)
+                elif self.proxy:
+                    logger.warning(f"Invalid proxy URL: {self.proxy}. Continuing without proxy.")
                 
                 # Disable pre-login flow which often causes issues
                 settings = await asyncio.to_thread(self.client.get_settings)
