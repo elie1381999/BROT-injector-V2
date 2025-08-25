@@ -1048,9 +1048,11 @@ conv = ConversationHandler(
     },
     fallbacks=[CommandHandler("start", start)],
     allow_reentry=True,
+    per_message=False,
 )
 
 help_cmd_handler = CommandHandler("help", help_cmd)
 
 dump_media_cmd_handler = CommandHandler("dump_media", dump_media_cmd)
+
 
