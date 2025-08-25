@@ -17,7 +17,8 @@ import aboutteleg
 import aboutadmin
 
 # ---------------- env & logging ----------------
-load_dotenv()
+load_dotenv()  # Works locally, Render ignores .env (use Environment tab instead)
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME")
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD")
@@ -28,6 +29,13 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("insta_bot")
+
+# Debug print to check env values on startup (safe partial token print)
+print("DEBUG ENV:", {
+    "TELEGRAM_BOT_TOKEN": (TELEGRAM_BOT_TOKEN[:10] + "...") if TELEGRAM_BOT_TOKEN else None,
+    "INSTAGRAM_USERNAME": INSTAGRAM_USERNAME,
+    "ADMIN_CHAT_ID": ADMIN_CHAT_ID_RAW,
+})
 
 # parse admin id
 ADMIN_CHAT_ID_INT: int | None = None
@@ -105,11 +113,9 @@ class InstagramWrapper:
         if not await self.ensure_login():
             return None
         try:
-            # Try GraphQL-based user_info first
             return await asyncio.to_thread(self.client.user_info, user_id)
         except KeyError as e:
-            logger.warning("KeyError in user_info_gql (missing 'data' key): %s", e)
-            # Fallback to user_info_by_username
+            logger.warning("KeyError in user_info_gql: %s", e)
             try:
                 username = await asyncio.to_thread(self.client.username_from_user_id, user_id)
                 if username:
@@ -199,7 +205,7 @@ def delete_webhook_sync():
 # ---------------- main ----------------
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN required in .env")
+        logger.error("TELEGRAM_BOT_TOKEN required in .env / Render env vars")
         return
 
     delete_webhook_sync()
@@ -219,10 +225,14 @@ def main():
         await asyncio.sleep(1)
         if ADMIN_CHAT_ID_INT:
             try:
-                await app.bot.send_message(chat_id=ADMIN_CHAT_ID_INT, text="🔔 Admin notifications enabled (startup test).", parse_mode="Markdown")
+                await app.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID_INT,
+                    text="🔔 Admin notifications enabled (startup test).",
+                    parse_mode=None
+                )
                 logger.info("Startup test message sent to admin.")
             except Exception:
-                logger.exception("Failed to send startup admin test message. Make sure admin started the bot and ADMIN_CHAT_ID is correct.")
+                logger.exception("Failed to send startup admin test message.")
 
     try:
         loop = asyncio.get_event_loop()
