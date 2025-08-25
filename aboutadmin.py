@@ -8,6 +8,7 @@ import asyncio
 import logging
 from telegram import Update
 from telegram.ext import ContextTypes
+import sys                 # <<< ADD THIS
 
 logger = logging.getLogger("insta_bot")
 
@@ -186,4 +187,5 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):
         try:
             await _send_admin_message(context, f"🚨 Bot error: `{_md_escape_short(str(err)[:1000])}`")
         except Exception:
+
             pass
