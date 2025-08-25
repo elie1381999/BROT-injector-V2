@@ -88,8 +88,13 @@ class InstagramWrapper:
             
         try:
             parsed = urlparse(proxy_url)
+            # Check if scheme and netloc exist, and if port is numeric when present
             if not all([parsed.scheme, parsed.netloc]):
                 return False
+            if ':' in parsed.netloc:
+                host, port = parsed.netloc.rsplit(':', 1)
+                if not port.isdigit() or not (1 <= int(port) <= 65535):
+                    return False
             return True
         except:
             return False
