@@ -1,6 +1,3 @@
-"""
-main.py — Main entry and connection with Instagram (safe startup).
-"""
 import os
 import logging
 import asyncio
@@ -12,6 +9,9 @@ from instagrapi.exceptions import LoginRequired, ChallengeRequired, PleaseWaitFe
 from telegram.ext import Application
 import time
 import socket
+import http.server
+import socketserver
+import threading
 
 import aboutteleg
 import aboutadmin
@@ -24,10 +24,10 @@ INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD")
 ADMIN_CHAT_ID_RAW = os.getenv("ADMIN_CHAT_ID")  # optional
 
 # webhook-related env vars
-USE_WEBHOOK = os.getenv("USE_WEBHOOK", "0") == "1"
+USE_WEBHOOK = os.getenv("USE_WEBHOOK", "1") == "1"
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. "https://your-app.onrender.com"
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH")  # optional custom path
-PORT = int(os.getenv("PORT", "8443"))
+PORT = int(os.getenv("PORT", "8000"))
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -54,22 +54,38 @@ class InstagramWrapper:
         self._lock = asyncio.Lock()
         self.login_attempts = 0
         self.last_attempt_ts = 0
+        self.session_file = "ig_session.json"
 
     async def ensure_login(self) -> bool:
         async with self._lock:
             now = time.time()
             if self.client:
                 return True
-            if self.login_attempts >= 3 and now - self.last_attempt_ts < 60:
-                logger.warning("Too many IG login attempts.")
+            if self.login_attempts >= 3 and now - self.last_attempt_ts < 300:  # 5-minute wait
+                logger.warning("Too many IG login attempts. Waiting before retry.")
                 return False
-            await asyncio.sleep(1)  # Delay to avoid rate limiting
+            await asyncio.sleep(2)  # Delay to avoid rate-limiting
             try:
                 logger.info("Initializing IG client (threaded).")
                 self.client = await asyncio.to_thread(Client)
+                # Load session if exists
+                if os.path.exists(self.session_file):
+                    logger.info("Loading Instagram session from file.")
+                    await asyncio.to_thread(self.client.load_settings, self.session_file)
+                    try:
+                        # Verify session
+                        await asyncio.to_thread(self.client.get_timeline_feed)
+                        logger.info("✅ IG session loaded successfully")
+                        self.login_attempts = 0
+                        return True
+                    except Exception:
+                        logger.warning("Loaded session is invalid; attempting new login.")
+                
                 ok = await asyncio.to_thread(self.client.login, INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
                 if ok:
                     logger.info("✅ IG login success")
+                    # Save session
+                    await asyncio.to_thread(self.client.dump_settings, self.session_file)
                     self.login_attempts = 0
                     return True
                 logger.error("IG login returned False")
@@ -90,7 +106,6 @@ class InstagramWrapper:
                 self.client = None
                 return False
 
-    # ... keep the rest of InstagramWrapper methods as you had them ...
     async def search_users(self, query: str, limit: int = 5):
         if not await self.ensure_login():
             return None
@@ -187,7 +202,6 @@ class InstagramWrapper:
             self.client = None
             return None
 
-
 # ---------------- bootstrap helpers ----------------
 def delete_webhook_sync():
     if not TELEGRAM_BOT_TOKEN:
@@ -202,44 +216,39 @@ def delete_webhook_sync():
     except Exception as e:
         logger.debug("deleteWebhook() non-fatal failure: %s", e)
 
-
 def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN required in .env")
         return
-
-    # remove any webhook (helpful when running in polling mode)
-    delete_webhook_sync()
 
     insta = InstagramWrapper()
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.bot_data['insta'] = insta
     app.bot_data['admin_chat_id'] = ADMIN_CHAT_ID_INT
 
-    # register handlers from aboutteleg
+    # Register handlers
     app.add_handler(aboutteleg.conv)
     app.add_handler(aboutteleg.help_cmd_handler)
     app.add_handler(aboutteleg.dump_media_cmd_handler)
-
-    # register error handler if available
     if hasattr(aboutadmin, "handle_error") and callable(aboutadmin.handle_error):
         app.add_error_handler(aboutadmin.handle_error)
     else:
         logger.warning("aboutadmin.handle_error not found; skipping add_error_handler.")
 
-    # Attempt to schedule a startup admin message:
+    # Schedule startup test job
     async def _startup_test_job(context):
         if ADMIN_CHAT_ID_INT:
             try:
+                hostname = aboutadmin._md_escape_short(socket.gethostname())
                 await context.bot.send_message(
                     chat_id=ADMIN_CHAT_ID_INT,
-                    text=f"🔔 Admin notifications enabled (startup test). host={socket.gethostname()} pid={os.getpid()}"
+                    text=f"🔔 Admin notifications enabled (startup test). host={hostname} pid={os.getpid()}",
+                    parse_mode="Markdown"
                 )
                 logger.info("Startup test message sent to admin.")
             except Exception:
-                logger.exception("Failed to send startup admin test message. Make sure admin started the bot and ADMIN_CHAT_ID is correct.")
+                logger.exception("Failed to send startup admin test message.")
 
-    # If job_queue is present (installed), schedule via it; otherwise we'll send a message after app starts.
     job_queue_available = getattr(app, "job_queue", None) is not None
     if job_queue_available:
         try:
@@ -247,15 +256,16 @@ def main():
         except Exception:
             logger.exception("Failed to schedule admin startup test job.")
     else:
-        logger.info("JobQueue not available or not installed. A startup admin message will be attempted after Application starts.")
+        logger.info("JobQueue not available. Startup message will be sent after app starts.")
+        async def post_start():
+            await asyncio.sleep(1)
+            await _startup_test_job(app)
+        asyncio.create_task(post_start())
 
-    # Decide whether to use webhook (recommended for Render) or polling
+    # Use webhook mode
     if USE_WEBHOOK and WEBHOOK_URL:
         logger.info("Starting application in WEBHOOK mode.")
-        if WEBHOOK_PATH:
-            url_path = WEBHOOK_PATH.strip("/")
-        else:
-            url_path = TELEGRAM_BOT_TOKEN.split(":")[0]
+        url_path = WEBHOOK_PATH.strip("/") if WEBHOOK_PATH else TELEGRAM_BOT_TOKEN.split(":")[0]
         webhook_url = f"{WEBHOOK_URL.rstrip('/')}/{url_path}"
         try:
             app.run_webhook(
@@ -264,21 +274,18 @@ def main():
                 url_path=url_path,
                 webhook_url=webhook_url,
             )
-        except Exception:
-            logger.exception("Failed to start webhook mode. Falling back to polling.")
-            try:
-                app.run_polling(allowed_updates="all")
-            except Exception as e:
-                logger.exception("Unhandled exception in polling fallback: %s", e)
+        except Exception as e:
+            logger.exception("Failed to start webhook mode: %s", e)
+            logger.info("Falling back to polling mode.")
+            app.run_polling(allowed_updates="all")
     else:
         logger.info("Starting application in POLLING mode.")
         try:
-            # If JobQueue not available, send the startup message directly after Application starts:
             app.run_polling(allowed_updates="all")
         except SystemExit:
             logger.info("Bot exiting.")
         except Exception as e:
-            logger.exception("Unhandled exception in main polling loop: %s", e)
+            logger.exception("Unhandled exception in polling loop: %s", e)
 
 if __name__ == "__main__":
     main()
