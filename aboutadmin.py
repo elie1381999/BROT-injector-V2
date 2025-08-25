@@ -1,8 +1,8 @@
 """
-aboutadmin.py — Admin logic and notifications (minimal, robust).
+aboutadmin.py — Admin logic and notifications (robust, safe).
 """
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 import time
 import asyncio
 import logging
@@ -13,13 +13,12 @@ from telegram.ext import ContextTypes
 
 logger = logging.getLogger("insta_bot")
 
+
 async def _send_admin_message(context: ContextTypes.DEFAULT_TYPE, text: str, parse_mode: str = "Markdown") -> bool:
-    admin_chat_id = None
     try:
         admin_chat_id = context.application.bot_data.get('admin_chat_id')
     except Exception:
-        # context might be None or malformed when called early; swallow safely
-        logger.debug("context.application.bot_data not available when sending admin message.")
+        admin_chat_id = None
     if not admin_chat_id:
         logger.debug("Skipping admin message because admin_chat_id is not configured.")
         return False
@@ -30,11 +29,14 @@ async def _send_admin_message(context: ContextTypes.DEFAULT_TYPE, text: str, par
         logger.exception("Failed sending admin message")
         return False
 
+
 def _md_escape_short(s: str) -> str:
+    if not isinstance(s, str):
+        s = str(s)
     return s.replace("`", "\\`").replace("*", "\\*")
 
-# A very small actor builder (keeps safe attribute access)
-def _actor_from_update(update: Optional[Update]) -> Dict[str, Any]:
+
+def _actor_from_update(update: Optional[Update]) -> dict:
     actor = {"id": None, "username": None, "name": None}
     try:
         if update and getattr(update, "effective_user", None):
@@ -48,48 +50,55 @@ def _actor_from_update(update: Optional[Update]) -> Dict[str, Any]:
         logger.exception("Error while building actor from update")
     return actor
 
+
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     """
     Central error handler. Detects Telegram 409 conflict and attempts graceful shutdown + admin notification.
-    This function MUST exist and be importable by main.py as aboutadmin.handle_error
+    Does NOT call sys.exit() so we avoid throwing SystemExit in event loop tasks.
     """
-    # Defensive access
     err = getattr(context, "error", None) if context is not None else None
     try:
         logger.exception("An error occurred: %s", err)
     except Exception:
-        # If logger has issues, ignore
         pass
 
+    # If it's the Telegram 409 conflict, notify admin and try to shut down gracefully.
     try:
         s = str(err or "")
         if "Conflict: terminated by other getUpdates request" in s or "terminated by other getUpdates request" in s:
             msg_text = (
                 "⚠️ *Telegram 409 Conflict detected*\n\n"
                 "Another getUpdates (polling) request or webhook is using this token. "
-                "Make sure only one bot instance is running and remove any webhook."
+                "Make sure only one bot instance is running and remove any webhook, or rotate the token."
             )
             logger.error("Telegram 409 Conflict detected.")
-            # notify admin if possible
+            # Try to notify admin
             try:
-                await _send_admin_message(context, msg_text)
+                if context is not None:
+                    await _send_admin_message(context, msg_text)
             except Exception:
-                logger.exception("Failed to send admin 409 notification.")
-            # attempt graceful stop
+                logger.exception("Failed to notify admin about 409.")
+
+            # Attempt graceful stop; if app not running, just log and return
             try:
-                await context.application.stop()
+                if context and getattr(context, "application", None):
+                    try:
+                        await context.application.stop()
+                        logger.info("Requested application.stop() due to 409.")
+                    except RuntimeError as e:
+                        # "This Application is not running!" or similar — log and continue
+                        logger.warning("Application.stop() raised RuntimeError (likely not running): %s", e)
+                    except Exception:
+                        logger.exception("Error while stopping application after 409.")
             except Exception:
-                logger.exception("Failed to stop application cleanly.")
-            # short pause and exit
-            time.sleep(0.3)
-            try:
-                sys.exit(1)
-            except Exception:
-                os._exit(1)
+                logger.exception("Unexpected error during shutdown attempt after 409.")
+
+            # Do NOT call sys.exit/os._exit here. Just return and let the Application/task clean up.
+            return
     except Exception:
         logger.exception("Error while processing exception context in handle_error.")
 
-    # fallback notify admin about other errors
+    # Generic fallback: try to notify admin about the error (non-409)
     try:
         if context is not None:
             await _send_admin_message(context, f"🚨 Bot error: `{_md_escape_short(str(err)[:1000])}`")
