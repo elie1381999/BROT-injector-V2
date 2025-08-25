@@ -1,242 +1,125 @@
-"""
-main.py — Main entry and connection with Instagram.
-"""
 import os
-import sys
 import logging
-import asyncio
+import time
+import json
 import urllib.request
 import urllib.error
-from dotenv import load_dotenv
-from instagrapi import Client
-from instagrapi.exceptions import LoginRequired, ChallengeRequired, PleaseWaitFewMinutes
-from telegram.ext import Application
-import time
+from typing import Optional
 
-import aboutteleg
-import aboutadmin
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 
-# ---------------- env & logging ----------------
-load_dotenv()
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME")
-INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD")
-ADMIN_CHAT_ID_RAW = os.getenv("ADMIN_CHAT_ID")  # optional
-
+# --- Logging setup ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger("insta_bot")
 
-# parse admin id
-ADMIN_CHAT_ID_INT: int | None = None
-if ADMIN_CHAT_ID_RAW:
-    try:
-        ADMIN_CHAT_ID_INT = int(ADMIN_CHAT_ID_RAW.strip())
-        logger.info("Admin notifications enabled for chat_id=%s", ADMIN_CHAT_ID_INT)
-    except Exception:
-        logger.exception("ADMIN_CHAT_ID in .env is invalid; admin notifications disabled.")
-        ADMIN_CHAT_ID_INT = None
-else:
-    logger.info("ADMIN_CHAT_ID not set; admin notifications disabled.")
+# --- Env variables ---
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 
-# ---------------- Instagram wrapper ----------------
-class InstagramWrapper:
-    def __init__(self):
-        self.client: Client | None = None
-        self._lock = asyncio.Lock()
-        self.login_attempts = 0
-        self.last_attempt_ts = 0
-
-    async def ensure_login(self) -> bool:
-        async with self._lock:
-            now = time.time()
-            if self.client:
-                return True
-            if self.login_attempts >= 3 and now - self.last_attempt_ts < 60:
-                logger.warning("Too many IG login attempts.")
-                return False
-            await asyncio.sleep(1)  # Delay to avoid rate limiting
-            try:
-                logger.info("Initializing IG client (threaded).")
-                self.client = await asyncio.to_thread(Client)
-                ok = await asyncio.to_thread(self.client.login, INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
-                if ok:
-                    logger.info("✅ IG login success")
-                    self.login_attempts = 0
-                    return True
-                logger.error("IG login returned False")
-                self.login_attempts += 1
-                self.last_attempt_ts = now
-                self.client = None
-                return False
-            except (LoginRequired, ChallengeRequired, PleaseWaitFewMinutes) as e:
-                logger.error("IG login special error: %s", e)
-                self.login_attempts += 1
-                self.last_attempt_ts = now
-                self.client = None
-                return False
-            except Exception as e:
-                logger.exception("Unexpected IG login error: %s", e)
-                self.login_attempts += 1
-                self.last_attempt_ts = now
-                self.client = None
-                return False
-
-    async def search_users(self, query: str, limit: int = 5):
-        if not await self.ensure_login():
-            return None
-        try:
-            users = await asyncio.to_thread(self.client.search_users, query)
-            return (users or [])[:limit]
-        except Exception:
-            logger.exception("search_users failed; retrying")
-            self.client = None
-            if await self.ensure_login():
-                try:
-                    users = await asyncio.to_thread(self.client.search_users, query)
-                    return (users or [])[:limit]
-                except Exception:
-                    logger.exception("search_users retry failed")
-            return None
-
-    async def get_user_info(self, user_id: int):
-        if not await self.ensure_login():
-            return None
-        try:
-            # Try GraphQL-based user_info first
-            return await asyncio.to_thread(self.client.user_info, user_id)
-        except KeyError as e:
-            logger.warning("KeyError in user_info_gql (missing 'data' key): %s", e)
-            # Fallback to user_info_by_username
-            try:
-                username = await asyncio.to_thread(self.client.username_from_user_id, user_id)
-                if username:
-                    return await asyncio.to_thread(self.client.user_info_by_username, username)
-            except Exception:
-                logger.exception("Fallback user_info_by_username failed")
-            return None
-        except Exception:
-            logger.exception("get_user_info failed; retrying")
-            self.client = None
-            if await self.ensure_login():
-                try:
-                    return await asyncio.to_thread(self.client.user_info, user_id)
-                except Exception:
-                    logger.exception("get_user_info retry failed")
-            return None
-
-    async def get_user_medias(self, user_id: int, amount: int = 40):
-        if not await self.ensure_login():
-            return []
-        try:
-            medias = await asyncio.to_thread(self.client.user_medias, user_id, amount)
-            return list(medias) if medias else []
-        except Exception:
-            logger.exception("get_user_medias failed; retrying")
-            self.client = None
-            if await self.ensure_login():
-                try:
-                    medias = await asyncio.to_thread(self.client.user_medias, user_id, amount)
-                    return list(medias) if medias else []
-                except Exception:
-                    logger.exception("get_user_medias retry failed")
-            return []
-
-    async def get_user_stories(self, user_id: int):
-        if not await self.ensure_login():
-            return []
-        try:
-            stories = await asyncio.to_thread(self.client.user_stories, user_id)
-            return list(stories) if stories else []
-        except Exception:
-            logger.exception("get_user_stories failed")
-            self.client = None
-            return []
-
-    async def get_user_highlights(self, user_id: int):
-        if not await self.ensure_login():
-            return []
-        try:
-            highlights = await asyncio.to_thread(self.client.user_highlights, user_id)
-            return list(highlights) if highlights else []
-        except Exception:
-            logger.exception("get_user_highlights failed; retrying")
-            self.client = None
-            if await self.ensure_login():
-                try:
-                    highlights = await asyncio.to_thread(self.client.user_highlights, user_id)
-                    return list(highlights) if highlights else []
-                except Exception:
-                    logger.exception("get_user_highlights retry failed")
-            return []
-
-    async def get_highlight_info(self, highlight_pk: int):
-        if not await self.ensure_login():
-            return None
-        try:
-            return await asyncio.to_thread(self.client.highlight_info, highlight_pk)
-        except Exception:
-            logger.exception("highlight_info failed")
-            self.client = None
-            return None
-
-# ---------------- bootstrap helpers ----------------
-def delete_webhook_sync():
+# --- Telegram API helpers ---
+def _telegram_api_request(path: str, timeout: int = 7) -> Optional[dict]:
+    """Low-level Telegram API request."""
     if not TELEGRAM_BOT_TOKEN:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
+        return None
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{path}"
     try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
-            _ = resp.read()
-            logger.info("Called deleteWebhook() (sync) at startup.")
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            raw = resp.read()
+            return json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as e:
-        logger.warning("deleteWebhook HTTPError: %s", e)
+        try:
+            body = e.read().decode("utf-8")
+            logger.warning("HTTPError %s: %s", e, body)
+        except Exception:
+            logger.warning("HTTPError %s (no body).", e)
+        return None
     except Exception as e:
-        logger.debug("deleteWebhook() non-fatal failure: %s", e)
+        logger.debug("Non-fatal _telegram_api_request error: %s", e)
+        return None
 
-# ---------------- main ----------------
+
+def delete_webhook_sync():
+    """Ensure webhook is removed before starting polling."""
+    if not TELEGRAM_BOT_TOKEN:
+        logger.debug("delete_webhook_sync: TELEGRAM_BOT_TOKEN not set")
+        return
+    try:
+        info = _telegram_api_request("getWebhookInfo")
+        result = info.get("result") if info else {}
+        url = result.get("url") if result else ""
+
+        if url:
+            logger.info("Existing webhook found: %s — deleting...", url)
+            res = _telegram_api_request("deleteWebhook")
+            logger.info("deleteWebhook response: %s", res)
+            time.sleep(1.2)
+            info2 = _telegram_api_request("getWebhookInfo")
+            url2 = (info2.get("result") or {}).get("url") if info2 else None
+            if not url2:
+                logger.info("Webhook deletion verified.")
+            else:
+                logger.warning("Webhook still present after delete: %s", url2)
+        else:
+            logger.info("No webhook configured; polling is safe.")
+    except Exception as e:
+        logger.exception("delete_webhook_sync unexpected error: %s", e)
+
+
+# --- Bot handlers ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command."""
+    user = update.effective_user
+    msg = f"Hello {user.first_name}, I'm alive!"
+    await update.message.reply_text(msg)
+
+    if ADMIN_CHAT_ID:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=f"👤 User started bot: {user.id} ({user.username})"
+        )
+
+
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Echo user messages and notify admin."""
+    user = update.effective_user
+    text = update.message.text
+    await update.message.reply_text(f"You said: {text}")
+
+    if ADMIN_CHAT_ID:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=f"📩 Message from {user.id} ({user.username}): {text}"
+        )
+
+
+# --- Main entrypoint ---
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN required in .env")
-        return
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set!")
 
+    # Delete any webhook before polling
     delete_webhook_sync()
 
-    insta = InstagramWrapper()
+    # Build bot app
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.bot_data['insta'] = insta
-    app.bot_data['admin_chat_id'] = ADMIN_CHAT_ID_INT
 
-    app.add_handler(aboutteleg.conv)
-    app.add_handler(aboutteleg.help_cmd_handler)
-    app.add_handler(aboutteleg.dump_media_cmd_handler)
-    app.add_error_handler(aboutadmin.handle_error)
+    # Handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
 
-    # startup test message to admin (if configured)
-    async def _startup_test():
-        await asyncio.sleep(1)
-        if ADMIN_CHAT_ID_INT:
-            try:
-                await app.bot.send_message(chat_id=ADMIN_CHAT_ID_INT, text="🔔 Admin notifications enabled (startup test).", parse_mode="Markdown")
-                logger.info("Startup test message sent to admin.")
-            except Exception:
-                logger.exception("Failed to send startup admin test message. Make sure admin started the bot and ADMIN_CHAT_ID is correct.")
+    logger.info("🚀 Bot starting polling mode...")
+    app.run_polling(allowed_updates=None)
 
-    try:
-        loop = asyncio.get_event_loop()
-        loop.create_task(_startup_test())
-    except Exception:
-        logger.exception("Failed to schedule admin startup test message.")
-
-    logger.info("🚀 Bot starting polling...")
-    try:
-        app.run_polling(allowed_updates="all")
-    except SystemExit:
-        logger.info("Bot exiting.")
-    except Exception as e:
-        logger.exception("Unhandled exception in main polling loop: %s", e)
 
 if __name__ == "__main__":
     main()
