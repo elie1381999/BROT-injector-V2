@@ -22,6 +22,12 @@ INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME")
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD")
 ADMIN_CHAT_ID_RAW = os.getenv("ADMIN_CHAT_ID")  # optional
 
+# webhook-related env vars
+USE_WEBHOOK = os.getenv("USE_WEBHOOK", "0") == "1"
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. "https://your-app.onrender.com"
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH")  # optional custom path
+PORT = int(os.getenv("PORT", "8443"))
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -199,6 +205,7 @@ def main():
         logger.error("TELEGRAM_BOT_TOKEN required in .env")
         return
 
+    # remove any webhook (helpful when running in polling mode)
     delete_webhook_sync()
 
     insta = InstagramWrapper()
@@ -206,6 +213,8 @@ def main():
     app.bot_data['insta'] = insta
     app.bot_data['admin_chat_id'] = ADMIN_CHAT_ID_INT
 
+    # register handlers from aboutteleg
+    # (these must exist in aboutteleg; keep these lines as in your original file)
     app.add_handler(aboutteleg.conv)
     app.add_handler(aboutteleg.help_cmd_handler)
     app.add_handler(aboutteleg.dump_media_cmd_handler)
@@ -223,23 +232,48 @@ def main():
                 logger.info("Startup test message sent to admin.")
             except Exception:
                 logger.exception(
-                    "Failed to send startup admin test message. "
-                    "Make sure admin started the bot and ADMIN_CHAT_ID is correct."
+                    "Failed to send startup admin test message. Make sure admin started the bot and ADMIN_CHAT_ID is correct."
                 )
 
+    # schedule startup task using Application.create_task (avoids get_event_loop usage)
     try:
-        loop = asyncio.get_event_loop()
-        loop.create_task(_startup_test())
+        app.create_task(_startup_test())
     except Exception:
         logger.exception("Failed to schedule admin startup test message.")
 
-    logger.info("🚀 Bot starting polling...")
-    try:
-        app.run_polling(allowed_updates="all")
-    except SystemExit:
-        logger.info("Bot exiting.")
-    except Exception as e:
-        logger.exception("Unhandled exception in main polling loop: %s", e)
+    # Decide whether to use webhook (recommended for Render) or polling
+    if USE_WEBHOOK and WEBHOOK_URL:
+        logger.info("Starting application in WEBHOOK mode.")
+        # choose a stable url_path: use WEBHOOK_PATH if set, otherwise token's bot id portion
+        if WEBHOOK_PATH:
+            url_path = WEBHOOK_PATH.strip("/")
+        else:
+            # TELEGRAM_BOT_TOKEN is of the form <bot_id>:<secret>
+            url_path = TELEGRAM_BOT_TOKEN.split(":")[0]
+
+        webhook_url = f"{WEBHOOK_URL.rstrip('/')}/{url_path}"
+
+        try:
+            app.run_webhook(
+                listen="0.0.0.0",
+                port=PORT,
+                url_path=url_path,
+                webhook_url=webhook_url,
+            )
+        except Exception:
+            logger.exception("Failed to start webhook mode. Falling back to polling.")
+            try:
+                app.run_polling(allowed_updates="all")
+            except Exception as e:
+                logger.exception("Unhandled exception in polling fallback: %s", e)
+    else:
+        logger.info("Starting application in POLLING mode.")
+        try:
+            app.run_polling(allowed_updates="all")
+        except SystemExit:
+            logger.info("Bot exiting.")
+        except Exception as e:
+            logger.exception("Unhandled exception in main polling loop: %s", e)
 
 if __name__ == "__main__":
     main()
