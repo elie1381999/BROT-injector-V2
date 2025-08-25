@@ -5,11 +5,12 @@ import urllib.request
 import urllib.error
 from dotenv import load_dotenv
 from instagrapi import Client
-from instagrapi.exceptions import LoginRequired, ChallengeRequired, PleaseWaitFewMinutes
+from instagrapi.exceptions import LoginRequired, ChallengeRequired, PleaseWaitFewMinutes, ClientForbiddenError
 from telegram.ext import Application
 import time
 import socket
 import random
+import json
 
 import aboutteleg
 import aboutadmin
@@ -66,6 +67,38 @@ class InstagramWrapper:
         self.last_attempt_ts = 0
         self.session_file = "ig_session.json"
         self.proxy = INSTAGRAM_PROXY
+        self.device_settings = {
+            "app_version": "270.0.0.0.0",
+            "android_version": 29,
+            "android_release": "10",
+            "dpi": "480dpi",
+            "resolution": "1080x1920",
+            "manufacturer": "Samsung",
+            "device": "SM-G973F",
+            "model": "Galaxy S10",
+            "cpu": "exynos9820",
+            "user_agent": "Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Mobile Safari/537.36"
+        }
+
+    async def resolve_challenge(self, challenge_exception):
+        """Handle Instagram challenge requirements"""
+        try:
+            challenge_info = challenge_exception.args[0]
+            logger.warning("Challenge required: %s", challenge_info)
+            
+            # Try to resolve via email (you might need to implement this differently)
+            if hasattr(challenge_exception, 'challenge_url'):
+                challenge_url = challenge_exception.challenge_url
+                logger.info("Challenge URL: %s", challenge_url)
+                
+                # For now, we'll just reset the client and hope for the best
+                # In a real implementation, you might want to prompt the user for a code
+                self.client = None
+                return False
+                
+        except Exception as e:
+            logger.exception("Error resolving challenge: %s", e)
+        return False
 
     async def ensure_login(self) -> bool:
         async with self._lock:
@@ -75,19 +108,23 @@ class InstagramWrapper:
             if self.login_attempts >= 3 and now - self.last_attempt_ts < 300:  # 5-minute wait
                 logger.warning("Too many IG login attempts. Waiting before retry.")
                 return False
-            await asyncio.sleep(random.uniform(2, 5))  # Random delay to avoid detection
+            await asyncio.sleep(random.uniform(3, 7))  # Increased random delay
             try:
                 logger.info("Initializing IG client (threaded).")
                 self.client = await asyncio.to_thread(Client)
+                
+                # Set device settings
+                await asyncio.to_thread(self.client.set_device, self.device_settings)
                 
                 # Set proxy if configured
                 if self.proxy:
                     logger.info(f"Using proxy: {self.proxy}")
                     await asyncio.to_thread(self.client.set_proxy, self.proxy)
                 
-                # Set a realistic user agent for cloud environments
-                user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-                await asyncio.to_thread(setattr, self.client, "user_agent", user_agent)
+                # Disable pre-login flow which often causes issues
+                settings = await asyncio.to_thread(self.client.get_settings)
+                settings["pre_login_flow"] = False
+                await asyncio.to_thread(self.client.set_settings, settings)
                 
                 # Load session if exists
                 if os.path.exists(self.session_file):
@@ -95,7 +132,7 @@ class InstagramWrapper:
                     await asyncio.to_thread(self.client.load_settings, self.session_file)
                     try:
                         # Verify session with a simple request
-                        await asyncio.sleep(random.uniform(1, 3))
+                        await asyncio.sleep(random.uniform(2, 4))
                         await asyncio.to_thread(self.client.get_timeline_feed)
                         logger.info("✅ IG session loaded successfully")
                         self.login_attempts = 0
@@ -104,7 +141,7 @@ class InstagramWrapper:
                         logger.warning("Loaded session is invalid; attempting new login.")
                 
                 # New login with additional delays
-                await asyncio.sleep(random.uniform(2, 4))
+                await asyncio.sleep(random.uniform(3, 5))
                 logger.info(f"Attempting login with username: {INSTAGRAM_USERNAME}")
                 ok = await asyncio.to_thread(self.client.login, INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
                 if ok:
@@ -120,10 +157,20 @@ class InstagramWrapper:
                 return False
             except (LoginRequired, ChallengeRequired, PleaseWaitFewMinutes) as e:
                 logger.error("IG login special error: %s", e)
+                if isinstance(e, ChallengeRequired):
+                    await self.resolve_challenge(e)
                 self.login_attempts += 1
                 self.last_attempt_ts = now
                 self.client = None
                 return False
+            except ClientForbiddenError as e:
+                logger.error("CSRF error: %s", e)
+                self.login_attempts += 1
+                self.last_attempt_ts = now
+                self.client = None
+                # Retry login after a short delay
+                await asyncio.sleep(5)
+                return await self.ensure_login()
             except Exception as e:
                 logger.exception("Unexpected IG login error: %s", e)
                 self.login_attempts += 1
@@ -135,7 +182,7 @@ class InstagramWrapper:
         if not await self.ensure_login():
             return None
         try:
-            await asyncio.sleep(random.uniform(1, 2))  # Add delay before request
+            await asyncio.sleep(random.uniform(2, 4))  # Increased delay
             users = await asyncio.to_thread(self.client.search_users, query)
             return (users or [])[:limit]
         except Exception:
@@ -143,7 +190,7 @@ class InstagramWrapper:
             self.client = None
             if await self.ensure_login():
                 try:
-                    await asyncio.sleep(random.uniform(1, 2))
+                    await asyncio.sleep(random.uniform(2, 4))
                     users = await asyncio.to_thread(self.client.search_users, query)
                     return (users or [])[:limit]
                 except Exception:
@@ -154,14 +201,14 @@ class InstagramWrapper:
         if not await self.ensure_login():
             return None
         try:
-            await asyncio.sleep(random.uniform(1, 2))
+            await asyncio.sleep(random.uniform(2, 4))
             return await asyncio.to_thread(self.client.user_info, user_id)
         except KeyError as e:
             logger.warning("KeyError in user_info_gql (missing 'data' key): %s", e)
             try:
                 username = await asyncio.to_thread(self.client.username_from_user_id, user_id)
                 if username:
-                    await asyncio.sleep(random.uniform(1, 2))
+                    await asyncio.sleep(random.uniform(2, 4))
                     return await asyncio.to_thread(self.client.user_info_by_username, username)
             except Exception:
                 logger.exception("Fallback user_info_by_username failed")
@@ -171,7 +218,7 @@ class InstagramWrapper:
             self.client = None
             if await self.ensure_login():
                 try:
-                    await asyncio.sleep(random.uniform(1, 2))
+                    await asyncio.sleep(random.uniform(2, 4))
                     return await asyncio.to_thread(self.client.user_info, user_id)
                 except Exception:
                     logger.exception("get_user_info retry failed")
@@ -181,7 +228,7 @@ class InstagramWrapper:
         if not await self.ensure_login():
             return []
         try:
-            await asyncio.sleep(random.uniform(1, 2))
+            await asyncio.sleep(random.uniform(2, 4))
             medias = await asyncio.to_thread(self.client.user_medias, user_id, amount)
             return list(medias) if medias else []
         except Exception:
@@ -189,7 +236,7 @@ class InstagramWrapper:
             self.client = None
             if await self.ensure_login():
                 try:
-                    await asyncio.sleep(random.uniform(1, 2))
+                    await asyncio.sleep(random.uniform(2, 4))
                     medias = await asyncio.to_thread(self.client.user_medias, user_id, amount)
                     return list(medias) if medias else []
                 except Exception:
@@ -200,7 +247,7 @@ class InstagramWrapper:
         if not await self.ensure_login():
             return []
         try:
-            await asyncio.sleep(random.uniform(1, 2))
+            await asyncio.sleep(random.uniform(2, 4))
             stories = await asyncio.to_thread(self.client.user_stories, user_id)
             return list(stories) if stories else []
         except Exception:
@@ -212,7 +259,7 @@ class InstagramWrapper:
         if not await self.ensure_login():
             return []
         try:
-            await asyncio.sleep(random.uniform(1, 2))
+            await asyncio.sleep(random.uniform(2, 4))
             highlights = await asyncio.to_thread(self.client.user_highlights, user_id)
             return list(highlights) if highlights else []
         except Exception:
@@ -220,7 +267,7 @@ class InstagramWrapper:
             self.client = None
             if await self.ensure_login():
                 try:
-                    await asyncio.sleep(random.uniform(1, 2))
+                    await asyncio.sleep(random.uniform(2, 4))
                     highlights = await asyncio.to_thread(self.client.user_highlights, user_id)
                     return list(highlights) if highlights else []
                 except Exception:
@@ -231,7 +278,7 @@ class InstagramWrapper:
         if not await self.ensure_login():
             return None
         try:
-            await asyncio.sleep(random.uniform(1, 2))
+            await asyncio.sleep(random.uniform(2, 4))
             return await asyncio.to_thread(self.client.highlight_info, highlight_pk)
         except Exception:
             logger.exception("highlight_info failed")
@@ -269,6 +316,9 @@ def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN required in .env")
         return
+
+    # Delete webhook at startup to ensure clean state
+    delete_webhook_sync()
 
     insta = InstagramWrapper()
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
