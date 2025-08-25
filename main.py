@@ -236,10 +236,27 @@ def main():
                 )
 
     # schedule startup task using Application.create_task (avoids get_event_loop usage)
+        # schedule a one-off startup job via the JobQueue (safe to configure before start)
+    async def _startup_test_job(context):
+        # 'context' is telegram.ext.CallbackContext; bot is available as context.bot
+        if ADMIN_CHAT_ID_INT:
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID_INT,
+                    text=f"🔔 Admin notifications enabled (startup test). host={__import__('socket').gethostname()} pid={__import__('os').getpid()}"
+                )
+                logger.info("Startup test message sent to admin.")
+            except Exception:
+                logger.exception(
+                    "Failed to send startup admin test message. Make sure admin started the bot and ADMIN_CHAT_ID is correct."
+                )
+
     try:
-        app.create_task(_startup_test())
+        # schedule _startup_test_job to run ~1 second after job queue starts
+        app.job_queue.run_once(_startup_test_job, when=1)
     except Exception:
-        logger.exception("Failed to schedule admin startup test message.")
+        logger.exception("Failed to schedule admin startup test job.")
+
 
     # Decide whether to use webhook (recommended for Render) or polling
     if USE_WEBHOOK and WEBHOOK_URL:
@@ -277,3 +294,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
