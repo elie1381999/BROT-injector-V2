@@ -22,7 +22,7 @@ ADMIN_CHAT_ID_RAW = os.getenv("ADMIN_CHAT_ID")  # optional
 
 # webhook-related env vars
 USE_WEBHOOK = os.getenv("USE_WEBHOOK", "1") == "1"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. "https://your-app.onrender.com"
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. "https://brot-injector-v2.onrender.com"
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH")  # optional custom path
 PORT = int(os.getenv("PORT", "8000"))
 
@@ -271,15 +271,26 @@ def main():
         except Exception as e:
             logger.exception("Failed to start webhook mode: %s", e)
             logger.info("Falling back to polling mode.")
-            app.run_polling(allowed_updates="all")
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                app.run_polling(allowed_updates="all")
+            except SystemExit:
+                logger.info("Bot exiting.")
+            except Exception as e:
+                logger.exception("Failed to start polling mode: %s", e)
+                raise
     else:
         logger.warning("Webhook mode disabled (USE_WEBHOOK=%s, WEBHOOK_URL=%s); starting in POLLING mode.", USE_WEBHOOK, WEBHOOK_URL)
         try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             app.run_polling(allowed_updates="all")
         except SystemExit:
             logger.info("Bot exiting.")
         except Exception as e:
-            logger.exception("Unhandled exception in polling loop: %s", e)
+            logger.exception("Failed to start polling mode: %s", e)
+            raise
 
 if __name__ == "__main__":
     main()
