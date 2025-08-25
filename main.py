@@ -9,6 +9,7 @@ from instagrapi.exceptions import LoginRequired, ChallengeRequired, PleaseWaitFe
 from telegram.ext import Application
 import time
 import socket
+import random
 
 import aboutteleg
 import aboutadmin
@@ -25,6 +26,9 @@ USE_WEBHOOK = os.getenv("USE_WEBHOOK", "1") == "1"
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. "https://brot-injector-v2.onrender.com"
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH")  # optional custom path
 PORT = int(os.getenv("PORT", "8000"))
+
+# Instagram proxy settings (for cloud deployment)
+INSTAGRAM_PROXY = os.getenv("INSTAGRAM_PROXY", "")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -44,6 +48,15 @@ if ADMIN_CHAT_ID_RAW:
 else:
     logger.info("ADMIN_CHAT_ID not set; admin notifications disabled.")
 
+# Enhanced Markdown-escape for Telegram Markdown V2
+def _md_escape_short(s: str) -> str:
+    if not isinstance(s, str):
+        s = str(s)
+    # Escape all Telegram Markdown V2 special characters
+    for char in ('*', '_', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'):
+        s = s.replace(char, f'\\{char}')
+    return s
+
 # ---------------- Instagram wrapper ----------------
 class InstagramWrapper:
     def __init__(self):
@@ -52,6 +65,7 @@ class InstagramWrapper:
         self.login_attempts = 0
         self.last_attempt_ts = 0
         self.session_file = "ig_session.json"
+        self.proxy = INSTAGRAM_PROXY
 
     async def ensure_login(self) -> bool:
         async with self._lock:
@@ -61,16 +75,27 @@ class InstagramWrapper:
             if self.login_attempts >= 3 and now - self.last_attempt_ts < 300:  # 5-minute wait
                 logger.warning("Too many IG login attempts. Waiting before retry.")
                 return False
-            await asyncio.sleep(2)  # Delay to avoid rate-limiting
+            await asyncio.sleep(random.uniform(2, 5))  # Random delay to avoid detection
             try:
                 logger.info("Initializing IG client (threaded).")
                 self.client = await asyncio.to_thread(Client)
+                
+                # Set proxy if configured
+                if self.proxy:
+                    logger.info(f"Using proxy: {self.proxy}")
+                    await asyncio.to_thread(self.client.set_proxy, self.proxy)
+                
+                # Set a realistic user agent for cloud environments
+                user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                await asyncio.to_thread(setattr, self.client, "user_agent", user_agent)
+                
                 # Load session if exists
                 if os.path.exists(self.session_file):
                     logger.info("Loading Instagram session from file.")
                     await asyncio.to_thread(self.client.load_settings, self.session_file)
                     try:
-                        # Verify session
+                        # Verify session with a simple request
+                        await asyncio.sleep(random.uniform(1, 3))
                         await asyncio.to_thread(self.client.get_timeline_feed)
                         logger.info("✅ IG session loaded successfully")
                         self.login_attempts = 0
@@ -78,6 +103,9 @@ class InstagramWrapper:
                     except Exception:
                         logger.warning("Loaded session is invalid; attempting new login.")
                 
+                # New login with additional delays
+                await asyncio.sleep(random.uniform(2, 4))
+                logger.info(f"Attempting login with username: {INSTAGRAM_USERNAME}")
                 ok = await asyncio.to_thread(self.client.login, INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
                 if ok:
                     logger.info("✅ IG login success")
@@ -107,6 +135,7 @@ class InstagramWrapper:
         if not await self.ensure_login():
             return None
         try:
+            await asyncio.sleep(random.uniform(1, 2))  # Add delay before request
             users = await asyncio.to_thread(self.client.search_users, query)
             return (users or [])[:limit]
         except Exception:
@@ -114,6 +143,7 @@ class InstagramWrapper:
             self.client = None
             if await self.ensure_login():
                 try:
+                    await asyncio.sleep(random.uniform(1, 2))
                     users = await asyncio.to_thread(self.client.search_users, query)
                     return (users or [])[:limit]
                 except Exception:
@@ -124,12 +154,14 @@ class InstagramWrapper:
         if not await self.ensure_login():
             return None
         try:
+            await asyncio.sleep(random.uniform(1, 2))
             return await asyncio.to_thread(self.client.user_info, user_id)
         except KeyError as e:
             logger.warning("KeyError in user_info_gql (missing 'data' key): %s", e)
             try:
                 username = await asyncio.to_thread(self.client.username_from_user_id, user_id)
                 if username:
+                    await asyncio.sleep(random.uniform(1, 2))
                     return await asyncio.to_thread(self.client.user_info_by_username, username)
             except Exception:
                 logger.exception("Fallback user_info_by_username failed")
@@ -139,6 +171,7 @@ class InstagramWrapper:
             self.client = None
             if await self.ensure_login():
                 try:
+                    await asyncio.sleep(random.uniform(1, 2))
                     return await asyncio.to_thread(self.client.user_info, user_id)
                 except Exception:
                     logger.exception("get_user_info retry failed")
@@ -148,6 +181,7 @@ class InstagramWrapper:
         if not await self.ensure_login():
             return []
         try:
+            await asyncio.sleep(random.uniform(1, 2))
             medias = await asyncio.to_thread(self.client.user_medias, user_id, amount)
             return list(medias) if medias else []
         except Exception:
@@ -155,6 +189,7 @@ class InstagramWrapper:
             self.client = None
             if await self.ensure_login():
                 try:
+                    await asyncio.sleep(random.uniform(1, 2))
                     medias = await asyncio.to_thread(self.client.user_medias, user_id, amount)
                     return list(medias) if medias else []
                 except Exception:
@@ -165,6 +200,7 @@ class InstagramWrapper:
         if not await self.ensure_login():
             return []
         try:
+            await asyncio.sleep(random.uniform(1, 2))
             stories = await asyncio.to_thread(self.client.user_stories, user_id)
             return list(stories) if stories else []
         except Exception:
@@ -176,6 +212,7 @@ class InstagramWrapper:
         if not await self.ensure_login():
             return []
         try:
+            await asyncio.sleep(random.uniform(1, 2))
             highlights = await asyncio.to_thread(self.client.user_highlights, user_id)
             return list(highlights) if highlights else []
         except Exception:
@@ -183,6 +220,7 @@ class InstagramWrapper:
             self.client = None
             if await self.ensure_login():
                 try:
+                    await asyncio.sleep(random.uniform(1, 2))
                     highlights = await asyncio.to_thread(self.client.user_highlights, user_id)
                     return list(highlights) if highlights else []
                 except Exception:
@@ -193,6 +231,7 @@ class InstagramWrapper:
         if not await self.ensure_login():
             return None
         try:
+            await asyncio.sleep(random.uniform(1, 2))
             return await asyncio.to_thread(self.client.highlight_info, highlight_pk)
         except Exception:
             logger.exception("highlight_info failed")
@@ -216,7 +255,7 @@ def delete_webhook_sync():
 async def post_start(context):
     if ADMIN_CHAT_ID_INT:
         try:
-            hostname = aboutadmin._md_escape_short(socket.gethostname())
+            hostname = _md_escape_short(socket.gethostname())
             await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID_INT,
                 text=f"🔔 Admin notifications enabled (startup test). host={hostname} pid={os.getpid()}",
