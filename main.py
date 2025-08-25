@@ -213,11 +213,11 @@ def delete_webhook_sync():
     except Exception as e:
         logger.debug("deleteWebhook() non-fatal failure: %s", e)
 
-async def post_start(app: Application):
+async def post_start(context):
     if ADMIN_CHAT_ID_INT:
         try:
             hostname = aboutadmin._md_escape_short(socket.gethostname())
-            await app.bot.send_message(
+            await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID_INT,
                 text=f"🔔 Admin notifications enabled (startup test). host={hostname} pid={os.getpid()}",
                 parse_mode="Markdown"
@@ -232,7 +232,7 @@ def main():
         return
 
     insta = InstagramWrapper()
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(lambda x: post_start(x)).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.bot_data['insta'] = insta
     app.bot_data['admin_chat_id'] = ADMIN_CHAT_ID_INT
 
@@ -249,12 +249,12 @@ def main():
     job_queue_available = getattr(app, "job_queue", None) is not None
     if job_queue_available:
         try:
-            app.job_queue.run_once(post_start, when=1, data=app)
+            app.job_queue.run_once(post_start, when=1)
             logger.info("Scheduled startup test job via JobQueue.")
         except Exception:
             logger.exception("Failed to schedule admin startup test job.")
     else:
-        logger.info("JobQueue not available. Startup message will be sent via post_init.")
+        logger.warning("JobQueue not available; startup message will not be sent.")
 
     # Use webhook mode
     if USE_WEBHOOK and WEBHOOK_URL:
@@ -273,7 +273,7 @@ def main():
             logger.info("Falling back to polling mode.")
             app.run_polling(allowed_updates="all")
     else:
-        logger.info("Starting application in POLLING mode.")
+        logger.warning("Webhook mode disabled (USE_WEBHOOK=%s, WEBHOOK_URL=%s); starting in POLLING mode.", USE_WEBHOOK, WEBHOOK_URL)
         try:
             app.run_polling(allowed_updates="all")
         except SystemExit:
