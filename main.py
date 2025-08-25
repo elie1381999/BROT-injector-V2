@@ -9,9 +9,6 @@ from instagrapi.exceptions import LoginRequired, ChallengeRequired, PleaseWaitFe
 from telegram.ext import Application
 import time
 import socket
-import http.server
-import socketserver
-import threading
 
 import aboutteleg
 import aboutadmin
@@ -216,13 +213,26 @@ def delete_webhook_sync():
     except Exception as e:
         logger.debug("deleteWebhook() non-fatal failure: %s", e)
 
+async def post_start(app: Application):
+    if ADMIN_CHAT_ID_INT:
+        try:
+            hostname = aboutadmin._md_escape_short(socket.gethostname())
+            await app.bot.send_message(
+                chat_id=ADMIN_CHAT_ID_INT,
+                text=f"🔔 Admin notifications enabled (startup test). host={hostname} pid={os.getpid()}",
+                parse_mode="Markdown"
+            )
+            logger.info("Startup test message sent to admin.")
+        except Exception:
+            logger.exception("Failed to send startup admin test message.")
+
 def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN required in .env")
         return
 
     insta = InstagramWrapper()
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(lambda x: post_start(x)).build()
     app.bot_data['insta'] = insta
     app.bot_data['admin_chat_id'] = ADMIN_CHAT_ID_INT
 
@@ -235,32 +245,16 @@ def main():
     else:
         logger.warning("aboutadmin.handle_error not found; skipping add_error_handler.")
 
-    # Schedule startup test job
-    async def _startup_test_job(context):
-        if ADMIN_CHAT_ID_INT:
-            try:
-                hostname = aboutadmin._md_escape_short(socket.gethostname())
-                await context.bot.send_message(
-                    chat_id=ADMIN_CHAT_ID_INT,
-                    text=f"🔔 Admin notifications enabled (startup test). host={hostname} pid={os.getpid()}",
-                    parse_mode="Markdown"
-                )
-                logger.info("Startup test message sent to admin.")
-            except Exception:
-                logger.exception("Failed to send startup admin test message.")
-
+    # Schedule startup test job if job_queue is available
     job_queue_available = getattr(app, "job_queue", None) is not None
     if job_queue_available:
         try:
-            app.job_queue.run_once(_startup_test_job, when=1)
+            app.job_queue.run_once(post_start, when=1, data=app)
+            logger.info("Scheduled startup test job via JobQueue.")
         except Exception:
             logger.exception("Failed to schedule admin startup test job.")
     else:
-        logger.info("JobQueue not available. Startup message will be sent after app starts.")
-        async def post_start():
-            await asyncio.sleep(1)
-            await _startup_test_job(app)
-        asyncio.create_task(post_start())
+        logger.info("JobQueue not available. Startup message will be sent via post_init.")
 
     # Use webhook mode
     if USE_WEBHOOK and WEBHOOK_URL:
