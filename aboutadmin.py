@@ -1,13 +1,3 @@
-"""
-aboutadmin.py — Admin logic and notifications (robust and feature-complete).
-Provides:
- - _send_admin_message
- - _md_escape_short
- - _actor_from_update
- - _immediate_admin_alert
- - buffer_admin_action  (aggregates admin events, sends delayed summary)
- - handle_error         (detects Telegram 409 conflict and attempts graceful shutdown)
-"""
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 import time
@@ -37,15 +27,25 @@ async def _send_admin_message(context: ContextTypes.DEFAULT_TYPE, text: str, par
     try:
         await context.bot.send_message(chat_id=admin_chat_id, text=text, parse_mode=parse_mode)
         return True
-    except Exception:
-        logger.exception("Failed sending admin message")
-        return False
+    except Exception as e:
+        logger.exception("Failed sending admin message with parse_mode=%s: %s", parse_mode, e)
+        # Retry without Markdown
+        try:
+            await context.bot.send_message(chat_id=admin_chat_id, text=text, parse_mode=None)
+            logger.info("Successfully sent admin message without parse_mode.")
+            return True
+        except Exception:
+            logger.exception("Failed sending admin message without parse_mode.")
+            return False
 
-# Minimal markdown-escape for backticks and asterisks to reduce parse errors
+# Minimal markdown-escape for backticks, asterisks, and other sensitive characters
 def _md_escape_short(s: str) -> str:
     if not isinstance(s, str):
         s = str(s)
-    return s.replace("`", "\\`").replace("*", "\\*")
+    # Escape all Markdown-sensitive characters
+    for char in ('*', '_', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'):
+        s = s.replace(char, f'\\{char}')
+    return s
 
 # Build actor dict from Update (prefer explicit contact if shared)
 def _actor_from_update(update: Update | None) -> Dict[str, Any]:
@@ -54,7 +54,6 @@ def _actor_from_update(update: Update | None) -> Dict[str, Any]:
         user = None
         if update and getattr(update, "effective_user", None):
             user = update.effective_user
-        # callback_query.from_user may be more accurate in callbacks
         if update and hasattr(update, "callback_query") and update.callback_query and update.callback_query.from_user:
             user = update.callback_query.from_user
         if user:
@@ -65,10 +64,8 @@ def _actor_from_update(update: Update | None) -> Dict[str, Any]:
                     " " + getattr(user, "last_name", "") if getattr(user, "last_name", "") else ""
                 )
             ).strip()
-        # contact phone (if user shared contact in message)
         if update and getattr(update, "message", None) and update.message and update.message.contact:
             actor["phone"] = getattr(update.message.contact, "phone_number", None)
-        # language from user_data (if available)
         if update and hasattr(update, "_user_data") and update._user_data:
             actor["language"] = update._user_data.get("language", "en")
     except Exception:
@@ -113,16 +110,13 @@ async def _immediate_admin_alert(context: ContextTypes.DEFAULT_TYPE, actor: Dict
 # ---------------- buffered admin-notification system (global) ----------------
 async def buffer_admin_action(context: ContextTypes.DEFAULT_TYPE, actor: Optional[dict], action: str, target: Optional[str] = None, extra: Optional[str] = None):
     """
-    Stores events in application-level buffer (context.application.bot_data) and schedules
-    a delayed summary ~60s after the last activity. Aggregates across all users.
-    Signature matches existing callers: buffer_admin_action(context, actor, action, target, extra)
+    Stores events in application-level buffer and schedules a delayed summary ~60s after the last activity.
     """
     try:
         admin_chat_id = context.application.bot_data.get('admin_chat_id')
     except Exception:
         admin_chat_id = None
     if not admin_chat_id:
-        # nothing to do if there is no admin to notify
         return
 
     app_data = context.application.bot_data
@@ -180,12 +174,10 @@ async def buffer_admin_action(context: ContextTypes.DEFAULT_TYPE, actor: Optiona
             app_data["admin_action_buffer"] = []
             app_data["_admin_timer_task"] = None
 
-    # Schedule the delayed send as a background task. Store it so we can cancel on new activity.
     try:
         task = asyncio.create_task(_delayed_send())
         app_data["_admin_timer_task"] = task
     except Exception:
-        # As a fallback, try to use the Application.create_task if available
         try:
             task = context.application.create_task(_delayed_send())
             app_data["_admin_timer_task"] = task
@@ -195,9 +187,7 @@ async def buffer_admin_action(context: ContextTypes.DEFAULT_TYPE, actor: Optiona
 # ---------------- error handler (409 detection) ----------------
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     """
-    Central error handler. Detects Telegram 409 conflict (another getUpdates/webhook)
-    and attempts graceful shutdown + admin notification. Does NOT call sys.exit()
-    to avoid raising SystemExit inside async tasks.
+    Central error handler. Detects Telegram 409 conflict and attempts graceful shutdown.
     """
     err = getattr(context, "error", None) if context is not None else None
     try:
@@ -214,13 +204,11 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):
                 "Make sure only one bot instance is running and remove any webhook, or rotate the token."
             )
             logger.error("Telegram 409 Conflict detected.")
-            # try to notify admin
             try:
                 if context is not None:
                     await _send_admin_message(context, msg_text)
             except Exception:
                 logger.exception("Failed to notify admin about 409.")
-            # Attempt graceful stop; if application not running, just log and return
             try:
                 if context and getattr(context, "application", None):
                     try:
@@ -236,7 +224,6 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("Error while processing exception context.")
 
-    # fallback: notify admin for non-409 errors
     try:
         if context is not None:
             await _send_admin_message(context, f"🚨 Bot error: `{_md_escape_short(str(err)[:1000])}`")
