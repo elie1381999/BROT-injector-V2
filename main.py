@@ -1,5 +1,5 @@
 """
-main.py — Main entry and connection with Instagram.
+main.py — Main entry and connection with Instagram (safe startup).
 """
 import os
 import logging
@@ -11,6 +11,7 @@ from instagrapi import Client
 from instagrapi.exceptions import LoginRequired, ChallengeRequired, PleaseWaitFewMinutes
 from telegram.ext import Application
 import time
+import socket
 
 import aboutteleg
 import aboutadmin
@@ -35,7 +36,7 @@ logging.basicConfig(
 logger = logging.getLogger("insta_bot")
 
 # parse admin id
-ADMIN_CHAT_ID_INT: int | None = None
+ADMIN_CHAT_ID_INT = None
 if ADMIN_CHAT_ID_RAW:
     try:
         ADMIN_CHAT_ID_INT = int(ADMIN_CHAT_ID_RAW.strip())
@@ -89,6 +90,7 @@ class InstagramWrapper:
                 self.client = None
                 return False
 
+    # ... keep the rest of InstagramWrapper methods as you had them ...
     async def search_users(self, query: str, limit: int = 5):
         if not await self.ensure_login():
             return None
@@ -185,6 +187,7 @@ class InstagramWrapper:
             self.client = None
             return None
 
+
 # ---------------- bootstrap helpers ----------------
 def delete_webhook_sync():
     if not TELEGRAM_BOT_TOKEN:
@@ -199,7 +202,7 @@ def delete_webhook_sync():
     except Exception as e:
         logger.debug("deleteWebhook() non-fatal failure: %s", e)
 
-# ---------------- main ----------------
+
 def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN required in .env")
@@ -214,62 +217,46 @@ def main():
     app.bot_data['admin_chat_id'] = ADMIN_CHAT_ID_INT
 
     # register handlers from aboutteleg
-    # (these must exist in aboutteleg; keep these lines as in your original file)
     app.add_handler(aboutteleg.conv)
     app.add_handler(aboutteleg.help_cmd_handler)
     app.add_handler(aboutteleg.dump_media_cmd_handler)
-    app.add_error_handler(aboutadmin.handle_error)
 
-    # startup test message to admin (if configured) WITHOUT parse_mode
-    async def _startup_test():
-        await asyncio.sleep(1)
-        if ADMIN_CHAT_ID_INT:
-            try:
-                await app.bot.send_message(
-                    chat_id=ADMIN_CHAT_ID_INT,
-                    text="🔔 Admin notifications enabled (startup test)."
-                )
-                logger.info("Startup test message sent to admin.")
-            except Exception:
-                logger.exception(
-                    "Failed to send startup admin test message. Make sure admin started the bot and ADMIN_CHAT_ID is correct."
-                )
+    # register error handler if available
+    if hasattr(aboutadmin, "handle_error") and callable(aboutadmin.handle_error):
+        app.add_error_handler(aboutadmin.handle_error)
+    else:
+        logger.warning("aboutadmin.handle_error not found; skipping add_error_handler.")
 
-    # schedule startup task using Application.create_task (avoids get_event_loop usage)
-        # schedule a one-off startup job via the JobQueue (safe to configure before start)
+    # Attempt to schedule a startup admin message:
     async def _startup_test_job(context):
-        # 'context' is telegram.ext.CallbackContext; bot is available as context.bot
         if ADMIN_CHAT_ID_INT:
             try:
                 await context.bot.send_message(
                     chat_id=ADMIN_CHAT_ID_INT,
-                    text=f"🔔 Admin notifications enabled (startup test). host={__import__('socket').gethostname()} pid={__import__('os').getpid()}"
+                    text=f"🔔 Admin notifications enabled (startup test). host={socket.gethostname()} pid={os.getpid()}"
                 )
                 logger.info("Startup test message sent to admin.")
             except Exception:
-                logger.exception(
-                    "Failed to send startup admin test message. Make sure admin started the bot and ADMIN_CHAT_ID is correct."
-                )
+                logger.exception("Failed to send startup admin test message. Make sure admin started the bot and ADMIN_CHAT_ID is correct.")
 
-    try:
-        # schedule _startup_test_job to run ~1 second after job queue starts
-        app.job_queue.run_once(_startup_test_job, when=1)
-    except Exception:
-        logger.exception("Failed to schedule admin startup test job.")
-
+    # If job_queue is present (installed), schedule via it; otherwise we'll send a message after app starts.
+    job_queue_available = getattr(app, "job_queue", None) is not None
+    if job_queue_available:
+        try:
+            app.job_queue.run_once(_startup_test_job, when=1)
+        except Exception:
+            logger.exception("Failed to schedule admin startup test job.")
+    else:
+        logger.info("JobQueue not available or not installed. A startup admin message will be attempted after Application starts.")
 
     # Decide whether to use webhook (recommended for Render) or polling
     if USE_WEBHOOK and WEBHOOK_URL:
         logger.info("Starting application in WEBHOOK mode.")
-        # choose a stable url_path: use WEBHOOK_PATH if set, otherwise token's bot id portion
         if WEBHOOK_PATH:
             url_path = WEBHOOK_PATH.strip("/")
         else:
-            # TELEGRAM_BOT_TOKEN is of the form <bot_id>:<secret>
             url_path = TELEGRAM_BOT_TOKEN.split(":")[0]
-
         webhook_url = f"{WEBHOOK_URL.rstrip('/')}/{url_path}"
-
         try:
             app.run_webhook(
                 listen="0.0.0.0",
@@ -286,6 +273,7 @@ def main():
     else:
         logger.info("Starting application in POLLING mode.")
         try:
+            # If JobQueue not available, send the startup message directly after Application starts:
             app.run_polling(allowed_updates="all")
         except SystemExit:
             logger.info("Bot exiting.")
@@ -294,4 +282,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
